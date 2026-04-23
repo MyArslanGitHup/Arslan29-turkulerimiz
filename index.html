@@ -197,7 +197,7 @@
 </div>
 
 <div id="search-box">
-  <input id="search-input" type="text" placeholder="Ara… (örn: gönül gel seninle muhabbet edelim)" autocomplete="off" spellcheck="false">
+  <input id="search-input" type="text" placeholder="Ara… (örn: gönül seninle)" autocomplete="off" spellcheck="false">
   <button id="search-clear">✕</button>
 </div>
 <div id="search-count"></div>
@@ -209,9 +209,10 @@
 <div id="cache-info"></div>
 
 <script>
-const API_KEY   = 'GDRIVE_API_KEY';
-const FOLDER_ID = 'GDRIVE_FOLDER_ID';
-const CACHE_URL = './cache.json';
+const API_KEY    = 'GDRIVE_API_KEY';
+const FOLDER_ID  = 'GDRIVE_FOLDER_ID';
+const CACHE_URL  = './cache.json';
+const FIREBASE_URL = 'https://arslan29-turkulerimiz-default-rtdb.firebaseio.com';
 
 // tracks: tüm parçalar, daima alfabetik sırada
 // displayList: şu an listede gösterilen parça indexleri (filtreli, alfabetik)
@@ -307,7 +308,11 @@ async function init() {
       cacheInfo.textContent = `${rawTracks.length} parça · Drive\'dan yüklendi`;
     }
     if (!rawTracks?.length) { statusEl.textContent = 'Hiç parça bulunamadı.'; return; }
-    tracks = rawTracks.map(t => ({ ...t, nameLower: trLower(t.name) }));
+    // En çok dinlenenleri üste al, eşit ise alfabetik
+    const playCounts = await fetchPlayCounts();
+    tracks = rawTracks
+      .map(t => ({ ...t, nameLower: trLower(t.name), playCount: playCounts[t.id] || 0 }))
+      .sort((a, b) => b.playCount - a.playCount || a.name.localeCompare(b.name, 'tr'));
     updateDisplayList();
     renderList();
 
@@ -471,6 +476,35 @@ function loadAndPlay(trackIdx) {
   updateActiveItem();
   updateURL(t.name);
   audio.play();
+  recordPlay(t.id);
+}
+
+// ─── FİREBASE ──────────────────────────────────────────────────────────────
+async function fetchPlayCounts() {
+  try {
+    const res = await fetch(`${FIREBASE_URL}/plays.json`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    return data || {};
+  } catch(e) {
+    return {};
+  }
+}
+
+async function recordPlay(trackId) {
+  try {
+    // Önce mevcut değeri oku
+    const res = await fetch(`${FIREBASE_URL}/plays/${trackId}.json`);
+    const current = res.ok ? (await res.json() || 0) : 0;
+    // 1 artır
+    await fetch(`${FIREBASE_URL}/plays/${trackId}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(current + 1)
+    });
+  } catch(e) {
+    console.warn('Dinleme kaydedilemedi:', e);
+  }
 }
 
 function playNext() {
