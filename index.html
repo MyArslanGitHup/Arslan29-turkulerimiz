@@ -449,8 +449,8 @@ function nameToSlug(name) {
 
 function updateURL(trackName) {
   const slug = nameToSlug(trackName);
-  const base = location.pathname.replace(/\/$/, '');
-  history.replaceState(null, '', base + '/' + slug);
+  const repoName = 'Arslan29-turkulerimiz';
+  history.replaceState(null, '', '/' + repoName + '/' + slug);
   document.title = trackName + ' · Türk Halk Müziği';
 }
 
