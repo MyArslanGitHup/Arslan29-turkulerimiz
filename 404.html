@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>Halk Müziği</title>
+<script>
+  // GitHub Pages 404 → SPA yönlendirme
+  // Slug'ı query string'e taşıyarak index.html'e yönlendir
+  var repo = '/Arslan29-turkulerimiz';
+  var path = window.location.pathname;
+  // /Arslan29-turkulerimiz/slug kısmından sadece slug'ı al
+  var slug = path.replace(repo, '').replace(/^\//, '').replace(/\/$/, '');
+  if (slug) {
+    window.location.replace(repo + '/?play=' + encodeURIComponent(slug));
+  } else {
+    window.location.replace(repo + '/');
+  }
+</script>
+</head>
+<body></body>
+</html>

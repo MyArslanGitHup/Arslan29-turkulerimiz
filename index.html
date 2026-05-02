@@ -529,7 +529,7 @@ async function init() {
     updateDisplayList();
     renderList();
 
-    // URL'de parça ismi varsa direkt o parçayı yükle (otomatik çalmaz)
+    // URL'de parça ismi varsa direkt o parçayı yükle ve çal
     const slug = getSlugFromURL();
     if (slug) {
       const ti = findTrackBySlug(slug);
@@ -541,6 +541,15 @@ async function init() {
         setNowPlaying(t.name);
         trackIndex.textContent = (playPos + 1) + ' / ' + playQueue.length;
         updateActiveItem();
+        // ?play= ile geldiyse URL'yi temizle (slug formatına çevir)
+        if (new URLSearchParams(location.search).get('play')) {
+          updateURL(t.name);
+        }
+        // Otomatik çalmayı dene
+        audio.play().catch(() => {
+          // Tarayıcı otomatik çalmayı engelledi — kullanıcı etkileşimi bekleniyor
+          btnPlayPause.innerHTML = '&#9654;';
+        });
       }
     }
   } catch(e) {
@@ -669,8 +678,13 @@ function updateURL(trackName) {
 }
 
 function getSlugFromURL() {
+  // Önce ?play= query param'ına bak (404.html yönlendirmesinden gelir)
+  const params = new URLSearchParams(location.search);
+  const playParam = params.get('play');
+  if (playParam) return playParam;
+
+  // Sonra pathname'den oku (doğrudan URL ile gelince)
   const parts = location.pathname.split('/').filter(Boolean);
-  // Son segment repo adı değilse slug'dır
   const repoName = 'Arslan29-turkulerimiz';
   const last = parts[parts.length - 1];
   return (last && last !== repoName) ? last : null;
