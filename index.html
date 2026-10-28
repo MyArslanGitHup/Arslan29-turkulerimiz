@@ -458,14 +458,39 @@ function trLower(str) {
     .replace(/Ç/g,'ç').toLowerCase();
 }
 
-function matchesSearch(track, queryLower) {
-  if (!queryLower) return true;
-  return queryLower.trim().split(/\s+/).filter(Boolean)
-    .every(w => track.nameLower.includes(w));
+// ─── AYARLAR ───────────────────────────────────────────────────────────────
+const FULL_LOAD_DELAY = 15000;      // tüm liste site açıldıktan 15 sn sonra yüklenir
+const PREVIEW_BYTES   = 64 * 1024;  // açılışta cache.json'ın yalnızca ilk ~64 KB'ı okunur
+const PREVIEW_MAX     = 500;        // açılışta gösterilecek en fazla parça sayısı
+const MIN_SEARCH_LEN  = 3;          // arama en az 3 harften sonra başlar
+const SEARCH_DELAY    = 350;        // yazmayı bıraktıktan sonra bekleme (ms)
+const RENDER_CHUNK    = 400;        // liste parça parça çizilir, sayfa donmaz
+
+const trCollator = new Intl.Collator('tr');
+
+let fullLoaded      = false;  // tüm liste yüklendi mi?
+let fullLoadPromise = null;
+let fullLoadTimer   = null;
+
+function currentTrackIdx() {
+  return playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
+}
+
+function showStatus(msg) {
+  listEl.innerHTML = '';
+  const d = document.createElement('div');
+  d.id = 'status'; d.textContent = msg;
+  listEl.appendChild(d);
 }
 
 function getTrackUrl(track) {
   return `https://www.googleapis.com/drive/v3/files/${track.id}?alt=media&key=${API_KEY}`;
+}
+
+function prepareTracks(rawTracks, playCounts) {
+  return rawTracks
+    .map(t => ({ ...t, nameLower: trLower(t.name), playCount: playCounts[t.id] || 0 }))
+    .sort((a, b) => b.playCount - a.playCount || trCollator.compare(a.name, b.name));
 }
 
 // ─── CACHE / DRIVE YÜKLEMESİ ───────────────────────────────────────────────
@@ -475,6 +500,37 @@ async function loadFromCache() {
   const data = await res.json();
   if (!data.tracks?.length) throw new Error('cache boş');
   return data.tracks;
+}
+
+// Açılış için hızlı ön izleme: cache.json'ın tamamını (≈5 MB) beklemeden
+// yalnızca ilk kısmını okur, içindeki tam parça kayıtlarını çıkarır, indirmeyi keser.
+async function loadPreview() {
+  const res = await fetch(CACHE_URL + '?t=' + Date.now());
+  if (!res.ok) throw new Error('cache yok');
+  if (!res.body || !res.body.getReader) { res.body?.cancel?.(); return []; }
+
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '', bytes = 0;
+  while (bytes < PREVIEW_BYTES) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.length;
+    text  += decoder.decode(value, { stream: true });
+  }
+  reader.cancel().catch(() => {});
+  if (text.length > PREVIEW_BYTES) text = text.slice(0, PREVIEW_BYTES);
+
+  const out = [];
+  const re = /\{[^{}]*\}/g;   // {"name": "...", "id": "..."} kayıtları
+  let m;
+  while (out.length < PREVIEW_MAX && (m = re.exec(text))) {
+    try {
+      const o = JSON.parse(m[0]);
+      if (o && o.name && o.id) out.push({ name: o.name, id: o.id });
+    } catch (_) {}
+  }
+  return out;
 }
 
 async function fetchFolder(folderId) {
@@ -506,62 +562,113 @@ async function loadFromDrive() {
   } catch(_) {}
   return all
     .map(f => ({ name: f.name.replace(/\.mp3$/i,''), id: f.id }))
-    .sort((a,b) => a.name.localeCompare(b.name,'tr'));
+    .sort((a,b) => trCollator.compare(a.name, b.name));
+}
+
+// ─── TÜM LİSTEYİ YÜKLE (15 sn sonra, arama yapılırsa ya da paylaşılan bağlantıyla hemen) ──
+function loadFull() {
+  if (fullLoadPromise) return fullLoadPromise;
+  clearTimeout(fullLoadTimer);
+
+  fullLoadPromise = (async () => {
+    const playCountsPromise = fetchPlayCounts();
+    let rawTracks, source;
+    try {
+      rawTracks = await loadFromCache();
+      source = 'önbellekten';
+    } catch(_) {
+      if (!tracks.length) showStatus('Drive\'dan yükleniyor… (ilk yükleme uzun sürebilir)');
+      rawTracks = await loadFromDrive();
+      source = 'Drive\'dan';
+    }
+    if (!rawTracks?.length) {
+      if (!tracks.length) showStatus('Hiç parça bulunamadı.');
+      return;
+    }
+    const playCounts = await playCountsPromise;
+
+    // Ön izlemede çalan parça varsa, yeni listede yerini bul — müzik kesilmez
+    const cur = currentTrackIdx();
+    const playingId = cur >= 0 ? tracks[cur].id : null;
+
+    tracks = prepareTracks(rawTracks, playCounts);
+    fullLoaded = true;
+    cacheInfo.textContent = `${tracks.length} parça · ${source} yüklendi`;
+
+    const newIdx = playingId ? tracks.findIndex(t => t.id === playingId) : -1;
+    updateDisplayList();
+    if (newIdx >= 0) {
+      buildPlayQueue(newIdx);
+      trackIndex.textContent = `${playPos + 1} / ${playQueue.length}`;
+    }
+    renderList();
+
+    if (newIdx < 0) playFromURL();
+  })().catch(e => {
+    console.error(e);
+    fullLoadPromise = null; // arama ile tekrar denenebilsin
+    if (!tracks.length) showStatus(`Hata: ${e.message}`);
+    else cacheInfo.textContent = `Tüm liste yüklenemedi: ${e.message}`;
+  });
+  return fullLoadPromise;
+}
+
+// URL'de parça ismi varsa direkt o parçayı yükle ve çal
+function playFromURL() {
+  const slug = getSlugFromURL();
+  if (!slug) return;
+  const ti = findTrackBySlug(slug);
+  if (ti < 0) return;
+  const qPos = playQueue.indexOf(ti);
+  playPos = qPos >= 0 ? qPos : 0;
+  const t = tracks[ti];
+  audio.src = getTrackUrl(t);
+  setNowPlaying(t.name);
+  trackIndex.textContent = (playPos + 1) + ' / ' + playQueue.length;
+  updateActiveItem();
+  // ?play= ile geldiyse URL'yi temizle (slug formatına çevir)
+  if (new URLSearchParams(location.search).get('play')) {
+    updateURL(t.name);
+  }
+  // Otomatik çalmayı dene
+  audio.play().catch(() => {
+    // Tarayıcı otomatik çalmayı engelledi — kullanıcı etkileşimi bekleniyor
+    btnPlayPause.innerHTML = '&#9654;';
+  });
 }
 
 // ─── INIT ──────────────────────────────────────────────────────────────────
 async function init() {
-  try {
-    let rawTracks;
-    try {
-      rawTracks = await loadFromCache();
-      cacheInfo.textContent = `${rawTracks.length} parça · önbellekten yüklendi`;
-    } catch(_) {
-      statusEl.textContent = 'Drive\'dan yükleniyor… (ilk yükleme uzun sürebilir)';
-      rawTracks = await loadFromDrive();
-      cacheInfo.textContent = `${rawTracks.length} parça · Drive\'dan yüklendi`;
-    }
-    if (!rawTracks?.length) { statusEl.textContent = 'Hiç parça bulunamadı.'; return; }
-    const playCounts = await fetchPlayCounts();
-    tracks = rawTracks
-      .map(t => ({ ...t, nameLower: trLower(t.name), playCount: playCounts[t.id] || 0 }))
-      .sort((a, b) => b.playCount - a.playCount || a.name.localeCompare(b.name, 'tr'));
-    updateDisplayList();
-    renderList();
+  // Paylaşılan parça bağlantısıyla gelindiyse parçayı bulmak için tüm liste gerekir
+  if (getSlugFromURL()) { loadFull(); return; }
 
-    // URL'de parça ismi varsa direkt o parçayı yükle ve çal
-    const slug = getSlugFromURL();
-    if (slug) {
-      const ti = findTrackBySlug(slug);
-      if (ti >= 0) {
-        const qPos = playQueue.indexOf(ti);
-        playPos = qPos >= 0 ? qPos : 0;
-        const t = tracks[ti];
-        audio.src = getTrackUrl(t);
-        setNowPlaying(t.name);
-        trackIndex.textContent = (playPos + 1) + ' / ' + playQueue.length;
-        updateActiveItem();
-        // ?play= ile geldiyse URL'yi temizle (slug formatına çevir)
-        if (new URLSearchParams(location.search).get('play')) {
-          updateURL(t.name);
-        }
-        // Otomatik çalmayı dene
-        audio.play().catch(() => {
-          // Tarayıcı otomatik çalmayı engelledi — kullanıcı etkileşimi bekleniyor
-          btnPlayPause.innerHTML = '&#9654;';
-        });
-      }
+  // Normal açılış: önce hafif ön izleme, tüm liste 15 sn sonra
+  fullLoadTimer = setTimeout(loadFull, FULL_LOAD_DELAY);
+  try {
+    const preview = await loadPreview();
+    if (!fullLoaded && !tracks.length && preview.length) {
+      tracks = prepareTracks(preview, {});
+      updateDisplayList();
+      renderList();
+      cacheInfo.textContent = `İlk ${tracks.length} parça gösteriliyor · tüm liste birazdan yüklenecek`;
     }
-  } catch(e) {
-    statusEl.textContent = `Hata: ${e.message}`;
-    console.error(e);
+  } catch(_) {
+    // Ön izleme alınamadı — tüm liste hemen yüklensin
+    loadFull();
   }
 }
 
-// ─── GÖRÜNTÜ LİSTESİ (her zaman alfabetik) ─────────────────────────────────
+// ─── GÖRÜNTÜ LİSTESİ ───────────────────────────────────────────────────────
+function getSearchWords() {
+  return trLower(searchQuery).trim().split(/\s+/).filter(Boolean);
+}
+
 function updateDisplayList() {
-  const qLower = trLower(searchQuery);
-  displayList = tracks.map((_,i)=>i).filter(i => matchesSearch(tracks[i], qLower));
+  const words = getSearchWords();
+  displayList = [];
+  for (let i = 0; i < tracks.length; i++) {
+    if (!words.length || words.every(w => tracks[i].nameLower.includes(w))) displayList.push(i);
+  }
   // playQueue'yu displayList'ten oluştur
   buildPlayQueue();
 }
@@ -586,78 +693,119 @@ function buildPlayQueue(keepCurrentTrack) {
   }
 }
 
+// Arama/temizleme sonrası listeyi yenile, çalan parçayı koru
+function refreshList() {
+  const cur = currentTrackIdx();
+  updateDisplayList();
+  if (cur >= 0) buildPlayQueue(cur);
+  renderList();
+}
+
 // ─── RENDER ────────────────────────────────────────────────────────────────
+// 40 bin satır tek seferde çizilmez: ilk parti hemen, kalanı arka planda
+// küçük partiler halinde eklenir. Yeni arama gelirse eski çizim iptal olur.
+let renderToken = 0;
+let itemEls     = new Map(); // tracks index → liste elemanı
+let activeEl    = null;
+
 function renderList() {
+  const token = ++renderToken;
   listEl.innerHTML = '';
+  listEl.scrollTop = 0;
+  itemEls  = new Map();
+  activeEl = null;
+
   if (!displayList.length) {
-    const d = document.createElement('div');
-    d.id = 'status'; d.textContent = 'Sonuç bulunamadı.';
-    listEl.appendChild(d); searchCount.textContent = ''; return;
+    showStatus(tracks.length ? 'Sonuç bulunamadı.' : 'Yükleniyor…');
+    searchCount.textContent = '';
+    return;
   }
   searchCount.textContent = searchQuery
     ? `${displayList.length} / ${tracks.length} sonuç`
-    : `${tracks.length} parça`;
+    : (fullLoaded ? `${tracks.length} parça` : `${tracks.length} parça · tüm liste yükleniyor…`);
 
-  const words = trLower(searchQuery).trim().split(/\s+/).filter(Boolean);
+  const words  = getSearchWords();
+  const hlRe   = words.length ? buildHighlightRegex(words) : null;
+  const curIdx = currentTrackIdx();
+  let pos = 0;
 
-  // Liste HER ZAMAN alfabetik (displayList sırası)
-  displayList.forEach((ti, pos) => {
-    const t = tracks[ti];
-    const div = document.createElement('div');
-    div.className = 'track-item';
-    div.dataset.trackidx = ti; // tracks içindeki gerçek index
-
-    if (words.length) {
-      div.innerHTML = `${pos+1}. ${highlightWords(t.name, words)}`;
-    } else {
-      div.textContent = `${pos+1}. ${t.name}`;
+  const step = () => {
+    if (token !== renderToken) return; // yeni bir çizim başladı
+    const frag = document.createDocumentFragment();
+    const end  = Math.min(pos + RENDER_CHUNK, displayList.length);
+    let activeInChunk = null;
+    for (; pos < end; pos++) {
+      const ti = displayList[pos];
+      const t  = tracks[ti];
+      const div = document.createElement('div');
+      div.className = 'track-item';
+      div.dataset.trackidx = ti; // tracks içindeki gerçek index
+      if (hlRe) div.innerHTML = `${pos+1}. ${highlightName(t.name, hlRe)}`;
+      else      div.textContent = `${pos+1}. ${t.name}`;
+      if (ti === curIdx) { div.classList.add('playing'); activeEl = activeInChunk = div; }
+      itemEls.set(ti, div);
+      frag.appendChild(div);
     }
-
-    div.addEventListener('click', () => {
-      // Tıklanan parçayı playQueue'da bul
-      const qPos = playQueue.indexOf(ti);
-      if (qPos >= 0) {
-        playPos = qPos;
-      } else {
-        // playQueue'da yoksa (arama sonucu değişti), yeniden kur
-        buildPlayQueue(ti);
-      }
-      loadAndPlay(ti);
-    });
-    listEl.appendChild(div);
-  });
-
-  updateActiveItem();
+    listEl.appendChild(frag);
+    if (activeInChunk) activeInChunk.scrollIntoView({ block: 'nearest' });
+    if (pos < displayList.length) setTimeout(step, 0);
+  };
+  step();
 }
 
-function highlightWords(name, words) {
-  let r = escapeHtml(name);
-  words.forEach(w => {
-    const pat = w.split('').map(c => {
-      for (const [lo,hi] of [['i','İ'],['ı','I'],['ğ','Ğ'],['ü','Ü'],['ş','Ş'],['ö','Ö'],['ç','Ç']]) {
-        if (c===lo) return `[${lo}${hi}]`;
-        if (c===hi) return `[${lo}${hi}]`;
-      }
-      return c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    }).join('');
-    try { r = r.replace(new RegExp(`(${pat})`,'gi'),'<span class="highlight">$1</span>'); } catch(_){}
-  });
-  return r;
+// Tek tıklama dinleyicisi (40 bin ayrı dinleyici yerine)
+listEl.addEventListener('click', e => {
+  const item = e.target.closest('.track-item');
+  if (!item) return;
+  const ti = parseInt(item.dataset.trackidx);
+  // Tıklanan parçayı playQueue'da bul
+  const qPos = playQueue.indexOf(ti);
+  if (qPos >= 0) {
+    playPos = qPos;
+  } else {
+    // playQueue'da yoksa (arama sonucu değişti), yeniden kur
+    buildPlayQueue(ti);
+  }
+  loadAndPlay(ti);
+});
+
+function buildHighlightRegex(words) {
+  const pats = words.map(w => w.split('').map(c => {
+    for (const [lo,hi] of [['i','İ'],['ı','I'],['ğ','Ğ'],['ü','Ü'],['ş','Ş'],['ö','Ö'],['ç','Ç']]) {
+      if (c===lo) return `[${lo}${hi}]`;
+      if (c===hi) return `[${lo}${hi}]`;
+    }
+    return c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  }).join(''));
+  try { return new RegExp(`(${pats.join('|')})`, 'gi'); } catch(_) { return null; }
+}
+
+function highlightName(name, re) {
+  let out = '', last = 0, m;
+  re.lastIndex = 0;
+  while ((m = re.exec(name))) {
+    if (!m[0]) { re.lastIndex++; continue; }
+    out += escapeHtml(name.slice(last, m.index)) + '<span class="highlight">' + escapeHtml(m[0]) + '</span>';
+    last = m.index + m[0].length;
+  }
+  return out + escapeHtml(name.slice(last));
 }
 
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// Şu an çalan parçayı listede vurgula (trackidx ile bul)
+// Şu an çalan parçayı listede vurgula
 function updateActiveItem() {
+  if (activeEl) activeEl.classList.remove('playing');
+  activeEl = null;
   if (playPos < 0 || !playQueue.length) return;
-  const currentTrackIdx = playQueue[playPos];
-  document.querySelectorAll('.track-item').forEach(el => {
-    el.classList.toggle('playing', parseInt(el.dataset.trackidx) === currentTrackIdx);
-  });
-  const active = listEl.querySelector('.playing');
-  if (active) active.scrollIntoView({ block: 'nearest' });
+  const el = itemEls.get(playQueue[playPos]);
+  if (el) {
+    el.classList.add('playing');
+    activeEl = el;
+    el.scrollIntoView({ block: 'nearest' });
+  }
 }
 
 // ─── PLAYBACK ──────────────────────────────────────────────────────────────
@@ -687,7 +835,7 @@ function getSlugFromURL() {
   const parts = location.pathname.split('/').filter(Boolean);
   const repoName = 'Arslan29-turkulerimiz';
   const last = parts[parts.length - 1];
-  return (last && last !== repoName) ? decodeURIComponent(last) : null;
+  return (last && last !== repoName && !/\.html?$/i.test(last)) ? decodeURIComponent(last) : null;
 }
 
 function findTrackBySlug(slug) {
@@ -827,28 +975,40 @@ updateVolUI();
 audio.addEventListener('ended', playNext);
 
 // ─── ARAMA — MÜZİĞİ KESMEDEN ───────────────────────────────────────────────
+// Her harfte arama yapılmaz: en az 3 harf yazılınca ve yazma durunca aranır.
 let searchTimer;
+
+function applySearch() {
+  const raw = searchInput.value.trim();
+  const q   = raw.length >= MIN_SEARCH_LEN ? raw : '';
+
+  if (q !== searchQuery) {
+    searchQuery = q;
+    if (q && !fullLoaded) {
+      // Arama tüm listede yapılmalı — 15 sn beklemeden tüm listeyi getir
+      searchCount.textContent = 'Arama için tüm liste yükleniyor…';
+      loadFull();
+      return;
+    }
+    refreshList(); // Müziği KESME — audio.src değişmiyor
+  }
+  if (raw && !q) searchCount.textContent = `Aramak için en az ${MIN_SEARCH_LEN} harf yazın`;
+}
+
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => {
-    searchQuery = searchInput.value;
-    // Şu an çalan parçayı kaydet
-    const currentTrackIdx = playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
-    updateDisplayList();
-    // playQueue'yu yeniden kur, mevcut parçayı koru
-    if (currentTrackIdx >= 0) buildPlayQueue(currentTrackIdx);
-    renderList();
-    // Müziği KESME — audio.src değişmiyor
-  }, 200);
+  searchTimer = setTimeout(applySearch, SEARCH_DELAY);
+});
+
+searchInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { clearTimeout(searchTimer); applySearch(); }
 });
 
 searchClear.addEventListener('click', () => {
+  clearTimeout(searchTimer);
   searchInput.value = '';
-  searchQuery = '';
-  const currentTrackIdx = playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
-  updateDisplayList();
-  if (currentTrackIdx >= 0) buildPlayQueue(currentTrackIdx);
-  renderList();
+  if (searchQuery) { searchQuery = ''; refreshList(); }
+  else if (tracks.length) renderList();
   searchInput.focus();
 });
 
