@@ -468,6 +468,11 @@
   </div>
 </div>
 
+<div id="search-box">
+  <input id="search-input" type="text" placeholder="Ara… (örn: Gönül gel seninle muhabbet edelim)" autocomplete="off" spellcheck="false">
+  <button id="search-clear">Temizle</button>
+</div>
+
 <div id="folder-box" hidden>
   <div id="folder-head">
     <span id="folder-toggle">▾ Klasörler</span>
@@ -479,10 +484,6 @@
   </div>
 </div>
 
-<div id="search-box">
-  <input id="search-input" type="text" placeholder="Ara… (örn: Gönül gel seninle muhabbet edelim)" autocomplete="off" spellcheck="false">
-  <button id="search-clear">Temizle</button>
-</div>
 <div id="search-count"></div>
 
 <div id="track-list-box">
@@ -576,8 +577,15 @@ let pendingFolderPlay = false; // tüm liste yüklenince klasörü çalmaya baş
 let folderExpanded    = new Set(); // kullanıcının açtığı klasörler (varsayılan: hepsi kapalı)
 let folderHasChildren = new Set(); // alt klasörü olan klasör yolları
 
+// Gerçekten çalan parça (id ile tutulur): çalan parça o an listede/sırada
+// olmasa bile (arama, klasör değişimi) doğru bilinsin.
+let playingId = null, playingIdxCache = -1;
 function currentTrackIdx() {
-  return playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
+  if (!playingId) return -1;
+  if (tracks[playingIdxCache]?.id !== playingId) {
+    playingIdxCache = tracks.findIndex(t => t.id === playingId);
+  }
+  return playingIdxCache;
 }
 
 function showStatus(msg) {
@@ -797,6 +805,12 @@ function renderFolders() {
 // Klasöre tıklanınca: liste yalnızca o klasörün parçalarını gösterir,
 // çalma sırası (karışık/sıralı) yalnızca o parçalardan oluşur ve çalmaya başlar.
 function selectFolder(path) {
+  // Klasör seçilince arama temizlenir: liste klasörün tüm içeriğini gösterir
+  if (path && (searchInput.value || searchQuery)) {
+    clearTimeout(searchTimer);
+    searchInput.value = '';
+    searchQuery = '';
+  }
   folderSelPath = path;
   computeFolderAllowed();
   renderFolders();
@@ -922,6 +936,7 @@ function playFromURL() {
   const qPos = playQueue.indexOf(ti);
   playPos = qPos >= 0 ? qPos : 0;
   const t = tracks[ti];
+  playingId = t.id; playingIdxCache = ti;
   audio.src = getTrackUrl(t);
   setNowPlaying(t.name);
   trackIndex.textContent = (playPos + 1) + ' / ' + playQueue.length;
@@ -990,7 +1005,8 @@ function buildPlayQueue(keepCurrentTrack) {
   // Eğer şu an çalan parça varsa, onu playQueue'da bul ve pozisyonu koru
   if (keepCurrentTrack !== undefined) {
     const pos = playQueue.indexOf(keepCurrentTrack);
-    playPos = pos >= 0 ? pos : 0;
+    // Çalan parça yeni sırada yoksa -1: "Sonraki" listenin ilk parçasından başlar
+    playPos = pos;
   } else {
     playPos = -1;
   }
@@ -1156,6 +1172,7 @@ function findTrackBySlug(slug) {
 
 function loadAndPlay(trackIdx) {
   const t = tracks[trackIdx];
+  playingId = t.id; playingIdxCache = trackIdx;
   audio.src = getTrackUrl(t);
   setNowPlaying(t.name);
   trackIndex.textContent = `${playPos + 1} / ${playQueue.length}`;
@@ -1295,6 +1312,13 @@ function applySearch() {
 
   if (q !== searchQuery) {
     searchQuery = q;
+    // Arama her zaman TÜM parçalarda yapılır: klasör seçiliyse "Tümü"ne dön
+    if (q && folderSelPath) {
+      folderSelPath = '';
+      pendingFolderPlay = false;
+      computeFolderAllowed();
+      renderFolders();
+    }
     if (q && !fullLoaded) {
       // Arama tüm listede yapılmalı — 15 sn beklemeden tüm listeyi getir
       searchCount.textContent = 'Arama için tüm liste yükleniyor…';
@@ -1332,8 +1356,8 @@ document.getElementById('btn-shuffle').addEventListener('click', function() {
   this.classList.add('active');
   document.getElementById('btn-seq').classList.remove('active');
   // Şu an çalan parçayı koru, çalma sırasını karıştır
-  const currentTrackIdx = playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
-  buildPlayQueue(currentTrackIdx >= 0 ? currentTrackIdx : undefined);
+  const cur = currentTrackIdx();
+  buildPlayQueue(cur >= 0 ? cur : undefined);
   // Liste görüntüsü değişmez, sadece vurguyu güncelle
   updateActiveItem();
 });
@@ -1343,8 +1367,8 @@ document.getElementById('btn-seq').addEventListener('click', function() {
   this.classList.add('active');
   document.getElementById('btn-shuffle').classList.remove('active');
   // Şu an çalan parçayı koru, sıralıya geç
-  const currentTrackIdx = playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
-  buildPlayQueue(currentTrackIdx >= 0 ? currentTrackIdx : undefined);
+  const cur = currentTrackIdx();
+  buildPlayQueue(cur >= 0 ? cur : undefined);
   updateActiveItem();
 });
 
