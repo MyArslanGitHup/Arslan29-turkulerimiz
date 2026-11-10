@@ -312,7 +312,16 @@
   }
   .folder-item:last-child { border-bottom: none; }
   .folder-item:hover { background: #222; }
-  .folder-item .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .folder-item .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .folder-item .ftoggle {
+    flex-shrink: 0;
+    width: 1.2rem;
+    margin: -0.5rem 0 -0.5rem -0.4rem;
+    padding: 0.5rem 0 0.5rem 0.4rem;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .folder-item .ftoggle:hover { color: var(--accent); }
   .folder-item .fcount { color: var(--muted); flex-shrink: 0; }
   .folder-item.active { color: var(--accent); }
   .folder-item.active .fcount { color: var(--accent); }
@@ -564,6 +573,8 @@ let foldersFromFull   = false; // klasörler tam cache'ten mi geldi?
 let folderSelPath     = '';    // seçili klasör yolu ('' = tümü)
 let folderAllowed     = null;  // seçili klasör + alt klasörlerinin index kümesi
 let pendingFolderPlay = false; // tüm liste yüklenince klasörü çalmaya başla
+let folderExpanded    = new Set(); // kullanıcının açtığı klasörler (varsayılan: hepsi kapalı)
+let folderHasChildren = new Set(); // alt klasörü olan klasör yolları
 
 function currentTrackIdx() {
   return playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
@@ -711,6 +722,10 @@ function setFolders(list) {
     }
     return a.parts.length - b.parts.length;
   });
+  folderHasChildren = new Set();
+  for (const f of folders) {
+    if (f.parts.length > 1) folderHasChildren.add(f.parts.slice(0, -1).join('/'));
+  }
   // Seçili klasör yeni listede yoksa "Tümü"ne dön
   if (folderSelPath && !folders.some(f => f.path === folderSelPath)) folderSelPath = '';
   computeFolderAllowed();
@@ -730,25 +745,42 @@ function renderFolders() {
   const q = trLower(folderFilter.value.trim());
   const frag = document.createDocumentFragment();
 
-  const mk = (path, label, count, depth) => {
+  // toggle: null = ok yok (aramada / "Tümü"), true/false = alt klasörü var (açık/kapalı)
+  const mk = (path, label, count, depth, toggle) => {
     const div = document.createElement('div');
     div.className = 'folder-item' + (path === folderSelPath ? ' active' : '');
     div.dataset.path = path;
     div.style.paddingLeft = (1 + depth * 0.9) + 'rem';
     div.title = path ? path.replace(/\//g, ' / ') : 'Tüm parçalar';
+    if (toggle !== null) {
+      const t = document.createElement('span');
+      t.className = 'ftoggle';
+      if (toggle !== undefined) {
+        t.textContent = toggle ? '▾' : '▸';
+        t.title = toggle ? 'Alt klasörleri kapat' : 'Alt klasörleri aç';
+      }
+      div.appendChild(t);
+    }
     const n = document.createElement('span'); n.className = 'fname';  n.textContent = label;
     const c = document.createElement('span'); c.className = 'fcount'; c.textContent = count;
     div.append(n, c);
     frag.appendChild(div);
   };
 
-  if (!q) mk('', 'Tümü', fullLoaded ? tracks.length : '', 0);
+  if (!q) mk('', 'Tümü', fullLoaded ? tracks.length : '', 0, null);
   for (const f of (folders.order || [])) {
     if (q) {
       if (!trLower(f.path).includes(q)) continue;
-      mk(f.path, f.path.replace(/\//g, ' / '), f.count, 0); // aramada tam yolu göster
+      mk(f.path, f.path.replace(/\//g, ' / '), f.count, 0, null); // aramada tam yolu göster
     } else {
-      mk(f.path, '📁 ' + f.name, f.count, f.depth);
+      // Üst klasörlerinden biri kapalıysa gösterme (varsayılan: hepsi kapalı)
+      let visible = true;
+      for (let i = 1; i < f.parts.length; i++) {
+        if (!folderExpanded.has(f.parts.slice(0, i).join('/'))) { visible = false; break; }
+      }
+      if (!visible) continue;
+      const toggle = folderHasChildren.has(f.path) ? folderExpanded.has(f.path) : undefined;
+      mk(f.path, '📁 ' + f.name, f.count, f.depth, toggle);
     }
   }
   if (!frag.childNodes.length) {
@@ -795,7 +827,21 @@ function applyFolder(autoPlay) {
 folderListEl.addEventListener('click', e => {
   const item = e.target.closest('.folder-item');
   if (!item || item.dataset.path === undefined) return;
-  selectFolder(item.dataset.path);
+  const path = item.dataset.path;
+  // Oka tıklandıysa yalnızca alt klasörleri aç/kapat — klasör seçilmez
+  if (e.target.closest('.ftoggle') && folderHasChildren.has(path)) {
+    if (folderExpanded.has(path)) folderExpanded.delete(path);
+    else folderExpanded.add(path);
+    renderFolders();
+    return;
+  }
+  // Klasör aramasıyla derindeki bir klasör seçilirse, arama temizlenince
+  // görünür kalsın diye yalnızca onun üst klasörleri açılır
+  if (folderFilter.value.trim()) {
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) folderExpanded.add(parts.slice(0, i).join('/'));
+  }
+  selectFolder(path);
 });
 
 folderHead.addEventListener('click', () => {
