@@ -244,6 +244,79 @@
   button:hover { border-color: var(--accent); color: var(--accent); }
   button.active { border-color: var(--accent); color: var(--accent); }
 
+  /* ─── KLASÖRLER ─── */
+  #folder-box {
+    width: 100%;
+    max-width: 480px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    margin-bottom: 1rem;
+  }
+  #folder-box[hidden] { display: none; }
+
+  #folder-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 1rem;
+    font-size: 0.65rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+  }
+  #folder-current {
+    color: var(--text);
+    letter-spacing: 0.05em;
+    text-transform: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 65%;
+  }
+
+  #folder-body { border-top: 1px solid var(--border); }
+  #folder-box.collapsed #folder-body { display: none; }
+
+  #folder-filter {
+    width: 100%;
+    background: var(--bg);
+    border: none;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 0.68rem;
+    padding: 0.45rem 1rem;
+    outline: none;
+  }
+  #folder-filter::placeholder { color: var(--muted); }
+
+  #folder-list {
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  #folder-list::-webkit-scrollbar { width: 4px; }
+  #folder-list::-webkit-scrollbar-thumb { background: var(--border); }
+
+  .folder-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0.5rem 1rem;
+    font-size: 0.7rem;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  .folder-item:last-child { border-bottom: none; }
+  .folder-item:hover { background: #222; }
+  .folder-item .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .folder-item .fcount { color: var(--muted); flex-shrink: 0; }
+  .folder-item.active { color: var(--accent); }
+  .folder-item.active .fcount { color: var(--accent); }
+
   #search-box {
     width: 100%;
     max-width: 480px;
@@ -386,6 +459,17 @@
   </div>
 </div>
 
+<div id="folder-box" hidden>
+  <div id="folder-head">
+    <span id="folder-toggle">▾ Klasörler</span>
+    <span id="folder-current">Tümü</span>
+  </div>
+  <div id="folder-body">
+    <input id="folder-filter" type="text" placeholder="Klasör ara…" autocomplete="off" spellcheck="false">
+    <div id="folder-list"></div>
+  </div>
+</div>
+
 <div id="search-box">
   <input id="search-input" type="text" placeholder="Ara… (örn: Gönül gel seninle muhabbet edelim)" autocomplete="off" spellcheck="false">
   <button id="search-clear">Temizle</button>
@@ -407,6 +491,7 @@
 const API_KEY      = 'AIzaSyDyRZUA937qtcVkiWiKC5gSk2BFp9S_S90';
 const FOLDER_ID    = '1zqzaui3XpdeWczXa1ARTGYdmg7Atdz9x';
 const CACHE_URL    = './cache.json';
+const FOLDERS_URL  = './folders.json';
 const FIREBASE_URL = 'https://arslan29-turkulerimiz-default-rtdb.firebaseio.com';
 
 // tracks: tüm parçalar, daima alfabetik sırada
@@ -472,6 +557,14 @@ let fullLoaded      = false;  // tüm liste yüklendi mi?
 let fullLoadPromise = null;
 let fullLoadTimer   = null;
 
+// ─── KLASÖR DURUMU ─────────────────────────────────────────────────────────
+// folders: cache'teki klasör listesi; parçalardaki "f" alanı bu listedeki index
+let folders           = [];    // [{ path, name, depth, count }]
+let foldersFromFull   = false; // klasörler tam cache'ten mi geldi?
+let folderSelPath     = '';    // seçili klasör yolu ('' = tümü)
+let folderAllowed     = null;  // seçili klasör + alt klasörlerinin index kümesi
+let pendingFolderPlay = false; // tüm liste yüklenince klasörü çalmaya başla
+
 function currentTrackIdx() {
   return playPos >= 0 && playQueue.length ? playQueue[playPos] : -1;
 }
@@ -499,7 +592,17 @@ async function loadFromCache() {
   if (!res.ok) throw new Error('cache yok');
   const data = await res.json();
   if (!data.tracks?.length) throw new Error('cache boş');
-  return data.tracks;
+  return { tracks: data.tracks, folders: data.folders || [] };
+}
+
+// Klasör listesi küçük ayrı dosyadan hemen gelir (tüm liste beklenmez)
+async function loadFolderList() {
+  try {
+    const res = await fetch(FOLDERS_URL + '?t=' + Date.now());
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!foldersFromFull && data.folders?.length) setFolders(data.folders);
+  } catch (_) {}
 }
 
 // Açılış için hızlı ön izleme: cache.json'ın tamamını (≈5 MB) beklemeden
@@ -527,18 +630,18 @@ async function loadPreview() {
   while (out.length < PREVIEW_MAX && (m = re.exec(text))) {
     try {
       const o = JSON.parse(m[0]);
-      if (o && o.name && o.id) out.push({ name: o.name, id: o.id });
+      if (o && o.name && o.id) out.push({ name: o.name, id: o.id, f: o.f });
     } catch (_) {}
   }
   return out;
 }
 
-async function fetchFolder(folderId) {
+async function fetchChildren(folderId) {
   let files = [], pt = null;
   do {
     let url = `https://www.googleapis.com/drive/v3/files?` +
-      `q=${encodeURIComponent(`'${folderId}' in parents and mimeType='audio/mpeg' and trashed=false`)}` +
-      `&fields=nextPageToken,files(id,name)&pageSize=1000&key=${API_KEY}`;
+      `q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}` +
+      `&fields=nextPageToken,files(id,name,mimeType)&pageSize=1000&key=${API_KEY}`;
     if (pt) url += `&pageToken=${encodeURIComponent(pt)}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Drive API: HTTP ${res.status}`);
@@ -549,21 +652,162 @@ async function fetchFolder(folderId) {
   return files;
 }
 
+// Yedek yol (cache yoksa): Drive'ı alt klasörleriyle birlikte tarar,
+// generate_cache.py ile aynı biçimde { tracks, folders } döndürür.
 async function loadFromDrive() {
-  let all = await fetchFolder(FOLDER_ID);
-  try {
-    const subRes = await fetch(`https://www.googleapis.com/drive/v3/files?` +
-      `q=${encodeURIComponent(`'${FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`)}` +
-      `&fields=files(id)&pageSize=100&key=${API_KEY}`);
-    if (subRes.ok) {
-      const sub = await subRes.json();
-      for (const f of (sub.files || [])) all = all.concat(await fetchFolder(f.id));
+  const found = [];       // { name, id, folder }
+  const visited = new Set();
+  async function walk(folderId, path) {
+    if (visited.has(folderId)) return;
+    visited.add(folderId);
+    for (const it of await fetchChildren(folderId)) {
+      if (it.mimeType === 'application/vnd.google-apps.folder') {
+        const safe = it.name.replace(/\//g, '-').trim() || '(adsız)';
+        try { await walk(it.id, path.concat(safe)); } catch (_) {}
+      } else if (/\.mp3$/i.test(it.name)) {
+        found.push({ name: it.name.replace(/\.mp3$/i, ''), id: it.id, folder: path.join('/') });
+      }
     }
-  } catch(_) {}
-  return all
-    .map(f => ({ name: f.name.replace(/\.mp3$/i,''), id: f.id }))
-    .sort((a,b) => trCollator.compare(a.name, b.name));
+  }
+  await walk(FOLDER_ID, []);
+
+  const counts = new Map();
+  for (const t of found) {
+    const parts = t.folder ? t.folder.split('/') : [];
+    for (let i = 1; i <= parts.length; i++) {
+      const p = parts.slice(0, i).join('/');
+      counts.set(p, (counts.get(p) || 0) + 1);
+    }
+  }
+  const paths = [...counts.keys()].sort((a, b) => trCollator.compare(a, b));
+  const index = new Map(paths.map((p, i) => [p, i]));
+  return {
+    tracks: found
+      .map(t => t.folder ? { name: t.name, id: t.id, f: index.get(t.folder) } : { name: t.name, id: t.id })
+      .sort((a, b) => trCollator.compare(a.name, b.name)),
+    folders: paths.map(p => ({ path: p, count: counts.get(p) })),
+  };
 }
+
+// ─── KLASÖRLER ─────────────────────────────────────────────────────────────
+const folderBox     = document.getElementById('folder-box');
+const folderHead    = document.getElementById('folder-head');
+const folderToggle  = document.getElementById('folder-toggle');
+const folderCurrent = document.getElementById('folder-current');
+const folderFilter  = document.getElementById('folder-filter');
+const folderListEl  = document.getElementById('folder-list');
+
+function setFolders(list) {
+  folders = (list || []).map((f, i) => {
+    const parts = f.path.split('/');
+    return { idx: i, path: f.path, parts, name: parts[parts.length - 1], depth: parts.length - 1, count: f.count || 0 };
+  });
+  // Görüntü sırası: üst klasör, hemen altında alt klasörleri (Türkçe alfabetik)
+  folders.order = folders.slice().sort((a, b) => {
+    const n = Math.min(a.parts.length, b.parts.length);
+    for (let i = 0; i < n; i++) {
+      const c = trCollator.compare(a.parts[i], b.parts[i]);
+      if (c) return c;
+    }
+    return a.parts.length - b.parts.length;
+  });
+  // Seçili klasör yeni listede yoksa "Tümü"ne dön
+  if (folderSelPath && !folders.some(f => f.path === folderSelPath)) folderSelPath = '';
+  computeFolderAllowed();
+  folderBox.hidden = !folders.length;
+  renderFolders();
+}
+
+function computeFolderAllowed() {
+  if (!folderSelPath) { folderAllowed = null; return; }
+  const pre = folderSelPath + '/';
+  folderAllowed = new Set(
+    folders.filter(f => f.path === folderSelPath || f.path.startsWith(pre)).map(f => f.idx)
+  );
+}
+
+function renderFolders() {
+  const q = trLower(folderFilter.value.trim());
+  const frag = document.createDocumentFragment();
+
+  const mk = (path, label, count, depth) => {
+    const div = document.createElement('div');
+    div.className = 'folder-item' + (path === folderSelPath ? ' active' : '');
+    div.dataset.path = path;
+    div.style.paddingLeft = (1 + depth * 0.9) + 'rem';
+    div.title = path ? path.replace(/\//g, ' / ') : 'Tüm parçalar';
+    const n = document.createElement('span'); n.className = 'fname';  n.textContent = label;
+    const c = document.createElement('span'); c.className = 'fcount'; c.textContent = count;
+    div.append(n, c);
+    frag.appendChild(div);
+  };
+
+  if (!q) mk('', 'Tümü', fullLoaded ? tracks.length : '', 0);
+  for (const f of (folders.order || [])) {
+    if (q) {
+      if (!trLower(f.path).includes(q)) continue;
+      mk(f.path, f.path.replace(/\//g, ' / '), f.count, 0); // aramada tam yolu göster
+    } else {
+      mk(f.path, '📁 ' + f.name, f.count, f.depth);
+    }
+  }
+  if (!frag.childNodes.length) {
+    const d = document.createElement('div');
+    d.className = 'folder-item'; d.style.cursor = 'default';
+    d.textContent = 'Klasör bulunamadı.';
+    frag.appendChild(d);
+  }
+  folderListEl.innerHTML = '';
+  folderListEl.appendChild(frag);
+  folderCurrent.textContent = folderSelPath ? folderSelPath.replace(/\//g, ' / ') : 'Tümü';
+}
+
+// Klasöre tıklanınca: liste yalnızca o klasörün parçalarını gösterir,
+// çalma sırası (karışık/sıralı) yalnızca o parçalardan oluşur ve çalmaya başlar.
+function selectFolder(path) {
+  folderSelPath = path;
+  computeFolderAllowed();
+  renderFolders();
+  if (path && !fullLoaded) {
+    // Klasörün tüm içeriği için tüm liste gerekir — 15 sn beklemeden getir
+    pendingFolderPlay = true;
+    searchCount.textContent = 'Klasör için tüm liste yükleniyor…';
+    loadFull();
+    return;
+  }
+  applyFolder(!!path);
+}
+
+function applyFolder(autoPlay) {
+  const cur = currentTrackIdx();
+  updateDisplayList();
+  const inList = cur >= 0 && displayList.includes(cur);
+  if (cur >= 0) buildPlayQueue(cur);
+  renderList();
+  if (autoPlay && !inList && playQueue.length) {
+    playPos = 0;
+    loadAndPlay(playQueue[0]);
+  } else if (inList) {
+    trackIndex.textContent = `${playPos + 1} / ${playQueue.length}`;
+  }
+}
+
+folderListEl.addEventListener('click', e => {
+  const item = e.target.closest('.folder-item');
+  if (!item || item.dataset.path === undefined) return;
+  selectFolder(item.dataset.path);
+});
+
+folderHead.addEventListener('click', () => {
+  const collapsed = folderBox.classList.toggle('collapsed');
+  folderToggle.textContent = (collapsed ? '▸' : '▾') + ' Klasörler';
+});
+
+let folderFilterTimer;
+folderFilter.addEventListener('input', () => {
+  clearTimeout(folderFilterTimer);
+  folderFilterTimer = setTimeout(renderFolders, 150);
+});
 
 // ─── TÜM LİSTEYİ YÜKLE (15 sn sonra, arama yapılırsa ya da paylaşılan bağlantıyla hemen) ──
 function loadFull() {
@@ -572,15 +816,16 @@ function loadFull() {
 
   fullLoadPromise = (async () => {
     const playCountsPromise = fetchPlayCounts();
-    let rawTracks, source;
+    let data, source;
     try {
-      rawTracks = await loadFromCache();
+      data = await loadFromCache();
       source = 'önbellekten';
     } catch(_) {
       if (!tracks.length) showStatus('Drive\'dan yükleniyor… (ilk yükleme uzun sürebilir)');
-      rawTracks = await loadFromDrive();
+      data = await loadFromDrive();
       source = 'Drive\'dan';
     }
+    const rawTracks = data.tracks;
     if (!rawTracks?.length) {
       if (!tracks.length) showStatus('Hiç parça bulunamadı.');
       return;
@@ -593,6 +838,8 @@ function loadFull() {
 
     tracks = prepareTracks(rawTracks, playCounts);
     fullLoaded = true;
+    foldersFromFull = true;
+    setFolders(data.folders); // parçalardaki "f" index'leri bu listeye göre
     cacheInfo.textContent = `${tracks.length} parça · ${source} yüklendi`;
 
     const newIdx = playingId ? tracks.findIndex(t => t.id === playingId) : -1;
@@ -603,7 +850,14 @@ function loadFull() {
     }
     renderList();
 
-    if (newIdx < 0) playFromURL();
+    if (pendingFolderPlay) {
+      // Tüm liste beklenirken bir klasöre tıklanmıştı — şimdi çalmaya başla
+      pendingFolderPlay = false;
+      if (folderSelPath && !(newIdx >= 0 && displayList.includes(newIdx)) && playQueue.length) {
+        playPos = 0;
+        loadAndPlay(playQueue[0]);
+      }
+    } else if (newIdx < 0) playFromURL();
   })().catch(e => {
     console.error(e);
     fullLoadPromise = null; // arama ile tekrar denenebilsin
@@ -640,6 +894,8 @@ function playFromURL() {
 // ─── INIT ──────────────────────────────────────────────────────────────────
 async function init() {
   // Paylaşılan parça bağlantısıyla gelindiyse parçayı bulmak için tüm liste gerekir
+  loadFolderList(); // klasör listesi hemen gösterilsin
+
   if (getSlugFromURL()) { loadFull(); return; }
 
   // Normal açılış: önce hafif ön izleme, tüm liste 15 sn sonra
@@ -667,6 +923,7 @@ function updateDisplayList() {
   const words = getSearchWords();
   displayList = [];
   for (let i = 0; i < tracks.length; i++) {
+    if (folderAllowed && !folderAllowed.has(tracks[i].f)) continue; // seçili klasör dışı
     if (!words.length || words.every(w => tracks[i].nameLower.includes(w))) displayList.push(i);
   }
   // playQueue'yu displayList'ten oluştur
@@ -715,14 +972,17 @@ function renderList() {
   itemEls  = new Map();
   activeEl = null;
 
+  const folderLabel = folderSelPath ? `📁 ${folderSelPath.replace(/\//g, ' / ')} · ` : '';
   if (!displayList.length) {
-    showStatus(tracks.length ? 'Sonuç bulunamadı.' : 'Yükleniyor…');
-    searchCount.textContent = '';
+    showStatus(!tracks.length ? 'Yükleniyor…'
+      : (folderSelPath && !searchQuery ? 'Bu klasörde parça yok.' : 'Sonuç bulunamadı.'));
+    searchCount.textContent = folderLabel;
     return;
   }
-  searchCount.textContent = searchQuery
-    ? `${displayList.length} / ${tracks.length} sonuç`
-    : (fullLoaded ? `${tracks.length} parça` : `${tracks.length} parça · tüm liste yükleniyor…`);
+  searchCount.textContent = folderLabel + (searchQuery
+    ? `${displayList.length} / ${folderSelPath ? folderTotal() : tracks.length} sonuç`
+    : folderSelPath ? `${displayList.length} parça`
+    : (fullLoaded ? `${tracks.length} parça` : `${tracks.length} parça · tüm liste yükleniyor…`));
 
   const words  = getSearchWords();
   const hlRe   = words.length ? buildHighlightRegex(words) : null;
@@ -751,6 +1011,11 @@ function renderList() {
     if (pos < displayList.length) setTimeout(step, 0);
   };
   step();
+}
+
+function folderTotal() {
+  const f = folders.find(x => x.path === folderSelPath);
+  return f ? f.count : tracks.length;
 }
 
 // Tek tıklama dinleyicisi (40 bin ayrı dinleyici yerine)
